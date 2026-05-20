@@ -6,11 +6,12 @@ import pandas as pd
 import plotly.graph_objects as go
 
 class SwapPricer:
-    def __init__(self, curve_data, euribor_rates=None):
+    def __init__(self, curve_data, rates_dict=None, is_ois=False):
         self.maturities = np.array(curve_data['maturities'])
         self.rates = np.array(curve_data['rates'])
         self.cs = CubicSpline(self.maturities, self.rates)
-        self.euribor_rates = euribor_rates or {}
+        self.rates_dict = rates_dict or {}
+        self.is_ois = is_ois
         
     def get_forward_rate(self, t1, t2):
         if t1 == 0:
@@ -25,6 +26,15 @@ class SwapPricer:
     def get_discount_factor(self, t):
         r = self.cs(t)
         return 1 / (1 + r * t)
+    
+    def get_rate_at_maturity(self, t):
+        """Récupère le taux à une maturity donnée (en années)"""
+        if t < self.maturities[0]:
+            return self.rates[0]
+        elif t > self.maturities[-1]:
+            return self.rates[-1]
+        else:
+            return self.cs(t)
     
     def day_count_fraction(self, start_date, end_date, convention):
         delta_days = (end_date - start_date).days
@@ -77,7 +87,7 @@ class SwapPricer:
         
         return dates
     
-    def _get_euribor_key(self, tenor_months):
+    def _get_rate_key(self, tenor_months):
         if tenor_months == 3:
             return '3M'
         elif tenor_months == 6:
@@ -87,9 +97,48 @@ class SwapPricer:
         else:
             return None
     
+    def calculate_ois_daily_composition(self, period_start, period_end, pricing_date, 
+                                       day_count_convention, spot_rate):
+        """
+        Compose le taux OIS jour par jour en interpolant sur la courbe.
+        spot_rate : le taux intraday actuel (taux overnight du jour)
+        """
+        current_date = period_start
+        compounded_rate = 1.0
+        
+        while current_date < period_end:
+            next_date = current_date + timedelta(days=1)
+            if next_date > period_end:
+                next_date = period_end
+            
+            # Calculer la maturity en années depuis la date de pricing
+            days_from_pricing = (current_date - pricing_date).days
+            maturity_years = days_from_pricing / 365.25
+            
+            # Récupérer le taux de la courbe pour cette date
+            if current_date == period_start and current_date == pricing_date:
+                # Pour le premier jour, utiliser le taux spot intraday
+                daily_rate = spot_rate
+            else:
+                # Pour les autres jours, interpoler sur la courbe
+                daily_rate = self.get_rate_at_maturity(maturity_years)
+            
+            # Calculer la fraction de jour
+            daily_fraction = self.day_count_fraction(current_date, next_date, day_count_convention)
+            
+            # Composer
+            compounded_rate *= (1 + daily_rate * daily_fraction)
+            current_date = next_date
+        
+        # Annualiser le taux composé
+        accrual_fraction = self.day_count_fraction(period_start, period_end, day_count_convention)
+        ois_rate = (compounded_rate - 1) / accrual_fraction
+        
+        return ois_rate
+    
     def price_swap(self, pricing_date, start_date, end_date, fixed_rate, 
                    spread, floating_tenor_months, day_count_convention, nominal,
-                   historical_rates=None):
+                   spot_rate=None, historical_rates=None):
 
         payment_dates = self.generate_payment_dates(start_date, end_date, 
                                                      floating_tenor_months)
@@ -100,7 +149,7 @@ class SwapPricer:
         pv_fixed = 0
         pv_floating = 0
         details = []
-        euribor_key = self._get_euribor_key(floating_tenor_months)
+        rate_key = self._get_rate_key(floating_tenor_months)
         
         for i in range(len(payment_dates) - 1):
             period_start = payment_dates[i]
@@ -119,18 +168,28 @@ class SwapPricer:
             fixed_coupon = fixed_rate * accrual_fraction * nominal
             pv_fixed += fixed_coupon * df
             
-            if period_start < pricing_date and historical_rates and period_start in historical_rates:
-                floating_rate = historical_rates[period_start] + spread
-                rate_source = "Historique"
-            elif period_start < pricing_date and euribor_key in self.euribor_rates:
-                floating_rate = self.euribor_rates[euribor_key] + spread
-                rate_source = "Euribor spot"
+            # Logique différente pour OIS vs taux terme
+            if self.is_ois:
+                # Pour OIS, composer jour par jour avec la courbe
+                floating_rate = self.calculate_ois_daily_composition(period_start, period_end, 
+                                                                     pricing_date, day_count_convention,
+                                                                     spot_rate)
+                floating_rate += spread
+                rate_source = "OIS Composé"
             else:
-                t1 = max(0, (period_start - pricing_date).days / 365.25)
-                t2 = (period_end - pricing_date).days / 365.25
-                forward_rate = self.get_forward_rate(t1, t2)
-                floating_rate = forward_rate + spread
-                rate_source = "Forward"
+                # Logique EURIBOR (taux terme)
+                if period_start < pricing_date and historical_rates and period_start in historical_rates:
+                    floating_rate = historical_rates[period_start] + spread
+                    rate_source = "Historique"
+                elif rate_key in self.rates_dict:
+                    floating_rate = self.rates_dict[rate_key] + spread
+                    rate_source = "Spot"
+                else:
+                    t1 = max(0, (period_start - pricing_date).days / 365.25)
+                    t2 = (period_end - pricing_date).days / 365.25
+                    forward_rate = self.get_forward_rate(t1, t2)
+                    floating_rate = forward_rate + spread
+                    rate_source = "Forward"
             
             floating_coupon = floating_rate * accrual_fraction * nominal
             pv_floating += floating_coupon * df
@@ -159,72 +218,8 @@ class SwapPricer:
             'nominal': nominal
         }
 
-# Configuration Streamlit
-st.set_page_config(page_title="Swap Pricer", layout="wide")
-st.title("💱 Swap Pricer Interactif")
-
-# Données par défaut
-curve_data = {
-    'maturities': [0.25, 0.5, 0.75, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 
-                   13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
-    'rates': [0.01963708, 0.01955476, 0.01951525, 0.01951413, 0.01981745, 0.02046718, 
-              0.02131799, 0.02227016, 0.0232563, 0.02423195, 0.0251688, 0.02604979, 
-              0.02686562, 0.02761227, 0.02828921, 0.02889817, 0.02944227, 0.02992544, 
-              0.03035198, 0.03072635, 0.03105292, 0.03133594, 0.03157939, 0.03178702, 
-              0.03196229, 0.03210839, 0.03222823, 0.03232447, 0.03239953, 0.03245559, 
-              0.03249465, 0.0325185, 0.03251876]
-}
-
-euribor_rates = {
-    '3M': 0.02122,
-    '6M': 0.02529,
-    '12M': 0.02932
-}
-
-historical_rates = {
-    datetime(2024, 1, 15): 0.0380,
-    datetime(2024, 7, 15): 0.0388,
-}
-
-pricer = SwapPricer(curve_data, euribor_rates=euribor_rates)
-
-# Sidebar pour les paramètres
-st.sidebar.header("📋 Paramètres du Swap")
-
-pricing_date = st.sidebar.date_input("Date de pricing", value=datetime(2026, 3, 30))
-start_date = st.sidebar.date_input("Date de début", value=datetime(2015, 3, 25))
-end_date = st.sidebar.date_input("Date de fin", value=datetime(2029, 11, 26))
-
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    fixed_rate = st.number_input("Taux fixe (%)", value=0.0, step=0.01) / 100
-    spread = st.number_input("Spread (%)", value=0.36, step=0.01) / 100
-
-with col2:
-    nominal = st.number_input("Nominal (€)", value=180000000, step=1000000)
-    floating_tenor = st.selectbox("Tenor flottant", [3, 6, 12], index=1)
-
-day_count = st.sidebar.selectbox("Convention de comptage", 
-                                  ["ACT/360", "ACT/365", "ACT/ACT", "30/360"])
-
-# Convertir les dates
-pricing_date = datetime.combine(pricing_date, datetime.min.time())
-start_date = datetime.combine(start_date, datetime.min.time())
-end_date = datetime.combine(end_date, datetime.min.time())
-
-# Calculer le swap
-if st.sidebar.button("🔄 Calculer", use_container_width=True):
-    result = pricer.price_swap(pricing_date, start_date, end_date, fixed_rate, 
-                               spread, floating_tenor, day_count, nominal,
-                               historical_rates=historical_rates)
-    
-    st.session_state.result = result
-
-# Afficher les résultats
-if 'result' in st.session_state:
-    result = st.session_state.result
-    
-    # KPIs principaux
+def display_results(result):
+    """Affiche les résultats du pricing"""
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -238,14 +233,12 @@ if 'result' in st.session_state:
     
     st.divider()
     
-    # Détails des périodes
     st.subheader("📊 Détails des Périodes")
     
     df_details = pd.DataFrame(result['details'])
     df_details['period_start'] = df_details['period_start'].dt.strftime('%Y-%m-%d')
     df_details['period_end'] = df_details['period_end'].dt.strftime('%Y-%m-%d')
     
-    # Formater les colonnes numériques
     numeric_cols = ['accrual_fraction', 'time_to_payment', 'discount_factor', 
                     'floating_rate', 'fixed_coupon', 'floating_coupon', 'pv_fixed', 'pv_floating']
     for col in numeric_cols:
@@ -253,11 +246,10 @@ if 'result' in st.session_state:
     
     st.dataframe(df_details, use_container_width=True)
     
-    # Graphiques
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("Flux de trésorerie")
+        st.subheader("💰 Flux de trésorerie")
         df_plot = pd.DataFrame(result['details'])
         fig = go.Figure()
         fig.add_trace(go.Bar(x=df_plot['period_end'].dt.strftime('%Y-%m-%d'), 
@@ -268,7 +260,7 @@ if 'result' in st.session_state:
         st.plotly_chart(fig, use_container_width=True)
     
     with col2:
-        st.subheader("Taux flottants par période")
+        st.subheader("📈 Taux flottants par période")
         df_plot = pd.DataFrame(result['details'])
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_plot['period_end'].dt.strftime('%Y-%m-%d'), 
@@ -277,9 +269,122 @@ if 'result' in st.session_state:
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
     
-    # Export
     st.divider()
     st.subheader("📥 Exporter les résultats")
     
     csv = df_details.to_csv(index=False)
     st.download_button(label="Télécharger CSV", data=csv, file_name="swap_details.csv", mime="text/csv")
+
+def create_pricer_page(page_name, curve_data, default_spot_rate, is_ois=False):
+    """Crée une page de pricer pour une devise donnée"""
+    st.title(f"🔄 Swap Pricer {page_name}")
+    
+    st.sidebar.header(f"⚙️ Paramètres du Swap {page_name}")
+    
+    # Définir les limites de dates
+    min_date = datetime(2000, 1, 1).date()
+    max_date = datetime(2050, 12, 31).date()
+    
+    pricing_date = st.sidebar.date_input("Date de pricing", 
+                                         value=datetime(2026, 3, 18).date(), 
+                                         min_value=min_date,
+                                         max_value=max_date,
+                                         key=f"pricing_{page_name}")
+    start_date = st.sidebar.date_input("Date de début", 
+                                       value=datetime(2025, 5, 19).date(), 
+                                       min_value=min_date,
+                                       max_value=max_date,
+                                       key=f"start_{page_name}")
+    end_date = st.sidebar.date_input("Date de fin", 
+                                     value=datetime(2030, 5, 19).date(), 
+                                     min_value=min_date,
+                                     max_value=max_date,
+                                     key=f"end_{page_name}")
+    
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        fixed_rate = st.number_input("Taux fixe (%)", value=0.0, step=0.0001, format="%.6f", key=f"fixed_{page_name}") / 100
+        spread = st.number_input("Spread (%)", value=0.0, step=0.0001, format="%.6f", key=f"spread_{page_name}") / 100
+    
+    with col2:
+        nominal = st.number_input("Nominal (€)", value=180000000, step=1000000, key=f"nominal_{page_name}")
+        floating_tenor = st.selectbox("Tenor flottant", [3, 6, 12], index=1, key=f"tenor_{page_name}")
+    
+    day_count = st.sidebar.selectbox("Convention de comptage", 
+                                      ["ACT/360", "ACT/365", "ACT/ACT", "30/360"], key=f"daycount_{page_name}")
+    
+    st.sidebar.divider()
+    
+    rates_dict = {}
+    spot_rate = None
+    
+    if is_ois:
+        st.sidebar.subheader(f"🌙 Taux Spot {page_name}")
+        spot_rate = st.sidebar.number_input(f"Taux Spot {page_name} (%)", 
+                                            value=default_spot_rate*100, 
+                                            step=0.0001, format="%.6f",
+                                            key=f"spot_{page_name}") / 100
+    else:
+        st.sidebar.subheader(f"📊 Taux {page_name}")
+        tenor_label = f"{floating_tenor}M"
+        rate_value = st.sidebar.number_input(f"Taux {tenor_label} (%)", 
+                                             value=default_spot_rate*100, 
+                                             step=0.0001, format="%.6f",
+                                             key=f"rate_{page_name}") / 100
+        rates_dict[tenor_label] = rate_value
+    
+    pricing_date = datetime.combine(pricing_date, datetime.min.time())
+    start_date = datetime.combine(start_date, datetime.min.time())
+    end_date = datetime.combine(end_date, datetime.min.time())
+    
+    pricer = SwapPricer(curve_data, rates_dict=rates_dict, is_ois=is_ois)
+    
+    if st.sidebar.button("🚀 Calculer", use_container_width=True, key=f"calc_{page_name}"):
+        result = pricer.price_swap(pricing_date, start_date, end_date, fixed_rate, 
+                                   spread, floating_tenor, day_count, nominal,
+                                   spot_rate=spot_rate)
+        st.session_state[f'result_{page_name}'] = result
+    
+    if f'result_{page_name}' in st.session_state:
+        display_results(st.session_state[f'result_{page_name}'])
+
+# Configuration Streamlit
+st.set_page_config(page_title="Swap Pricer Multi-Devises", layout="wide")
+
+# Données des courbes EURIBOR
+curve_data_euribor = {
+    'maturities': [0.25, 0.5, 0.75, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 
+                   13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+    'rates': [0.01963708, 0.01955476, 0.01951525, 0.01951413, 0.01981745, 0.02046718, 
+              0.02131799, 0.02227016, 0.0232563, 0.02423195, 0.0251688, 0.02604979, 
+              0.02686562, 0.02761227, 0.02828921, 0.02889817, 0.02944227, 0.02992544, 
+              0.03035198, 0.03072635, 0.03105292, 0.03133594, 0.03157939, 0.03178702, 
+              0.03196229, 0.03210839, 0.03222823, 0.03232447, 0.03239953, 0.03245559, 
+              0.03249465, 0.0325185, 0.03251876]
+}
+
+# Données des courbes SOFR (en années)
+curve_data_sofr = {
+    'maturities': [1/52, 2/52, 3/52, 1/12, 2/12, 3/12, 4/12, 5/12, 6/12, 7/12, 8/12, 9/12, 10/12, 11/12, 1, 
+                   1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 40, 50],
+    'rates': [0.03537, 0.03560, 0.03561, 0.03576, 0.03607, 0.03633, 0.03653, 0.03676, 0.03702, 0.03725, 0.03756, 0.03785, 0.03809, 0.03837, 0.03862,
+              0.03936, 0.03974, 0.03994, 0.04013, 0.04044, 0.04082, 0.04122, 0.04161, 0.04199, 0.04237, 0.04311, 0.04404, 0.04476, 0.04469, 0.04428, 0.04310, 0.04178]
+}
+
+# Données des courbes ESTR (en années)
+curve_data_estr = {
+    'maturities': [1/52, 2/52, 1/12, 2/12, 3/12, 4/12, 5/12, 6/12, 7/12, 8/12, 9/12, 10/12, 11/12, 1, 
+                   1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 20, 25, 30, 40, 50],
+    'rates': [0.01932, 0.01932, 0.01969, 0.02060, 0.02129, 0.02181, 0.02242, 0.02296, 0.02335, 0.02381, 0.02422, 0.02455, 0.02487, 0.02518,
+              0.02609, 0.02647, 0.02678, 0.02713, 0.02754, 0.02798, 0.02847, 0.02899, 0.02947, 0.02993, 0.03033, 0.03078, 0.03174, 0.03232, 0.03216, 0.03178, 0.03070, 0.02946]
+}
+
+# Navigation
+page = st.sidebar.radio("📍 Sélectionner une devise", ["EURIBOR", "SOFR", "ESTR"])
+
+if page == "EURIBOR":
+    create_pricer_page("EURIBOR", curve_data_euribor, 0.02122, is_ois=False)
+elif page == "SOFR":
+    create_pricer_page("SOFR", curve_data_sofr, 0.03537, is_ois=True)
+elif page == "ESTR":
+    create_pricer_page("ESTR", curve_data_estr, 0.01932, is_ois=True)
