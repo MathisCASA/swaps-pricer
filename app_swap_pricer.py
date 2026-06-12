@@ -934,7 +934,7 @@ st.markdown("""
         <div style="font-size:1.2rem;font-weight:800;color:#006A3C;
                     letter-spacing:0.02em">Swap Pricer</div>
         <div style="font-size:0.78rem;color:#888;letter-spacing:0.04em;
-                    text-transform:uppercase">Crédit Agricole CIB — Marchés de taux</div>
+                    text-transform:uppercase">Crédit Agricole — Marchés de taux</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
