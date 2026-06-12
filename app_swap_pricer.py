@@ -4,6 +4,12 @@ from datetime import datetime, timedelta
 from scipy.interpolate import CubicSpline
 import pandas as pd
 import plotly.graph_objects as go
+from enum import Enum
+
+class SwapType(Enum):
+    VANILLA = "Vanilla"
+    OIS = "OIS"
+    INFLATION = "Inflation"
 
 class SwapPricer:
     def __init__(self, curve_data, rates_dict=None, is_ois=False):
@@ -101,7 +107,6 @@ class SwapPricer:
                                        day_count_convention, spot_rate):
         """
         Compose le taux OIS jour par jour en interpolant sur la courbe.
-        spot_rate : le taux intraday actuel (taux overnight du jour)
         """
         current_date = period_start
         compounded_rate = 1.0
@@ -111,26 +116,18 @@ class SwapPricer:
             if next_date > period_end:
                 next_date = period_end
             
-            # Calculer la maturity en années depuis la date de pricing
             days_from_pricing = (current_date - pricing_date).days
             maturity_years = days_from_pricing / 365.25
             
-            # Récupérer le taux de la courbe pour cette date
             if current_date == period_start and current_date == pricing_date:
-                # Pour le premier jour, utiliser le taux spot intraday
                 daily_rate = spot_rate
             else:
-                # Pour les autres jours, interpoler sur la courbe
                 daily_rate = self.get_rate_at_maturity(maturity_years)
             
-            # Calculer la fraction de jour
             daily_fraction = self.day_count_fraction(current_date, next_date, day_count_convention)
-            
-            # Composer
             compounded_rate *= (1 + daily_rate * daily_fraction)
             current_date = next_date
         
-        # Annualiser le taux composé
         accrual_fraction = self.day_count_fraction(period_start, period_end, day_count_convention)
         ois_rate = (compounded_rate - 1) / accrual_fraction
         
@@ -168,16 +165,13 @@ class SwapPricer:
             fixed_coupon = fixed_rate * accrual_fraction * nominal
             pv_fixed += fixed_coupon * df
             
-            # Logique différente pour OIS vs taux terme
             if self.is_ois:
-                # Pour OIS, composer jour par jour avec la courbe
                 floating_rate = self.calculate_ois_daily_composition(period_start, period_end, 
                                                                      pricing_date, day_count_convention,
                                                                      spot_rate)
                 floating_rate += spread
                 rate_source = "OIS Composé"
             else:
-                # Logique EURIBOR (taux terme)
                 if period_start < pricing_date and historical_rates and period_start in historical_rates:
                     floating_rate = historical_rates[period_start] + spread
                     rate_source = "Historique"
@@ -218,8 +212,188 @@ class SwapPricer:
             'nominal': nominal
         }
 
-def display_results(result):
-    """Affiche les résultats du pricing"""
+
+class InflationSwapPricer:
+    def __init__(self, inflation_curve_data, discount_curve_data):
+        """
+        inflation_curve_data: Courbe ZCPN d'inflation (Bloomberg format)
+        discount_curve_data: Courbe de taux nominale pour les facteurs d'actualisation
+        """
+        self.inf_maturities = np.array(inflation_curve_data['maturities'])
+        self.inf_rates = np.array(inflation_curve_data['rates'])
+        self.inf_cs = CubicSpline(self.inf_maturities, self.inf_rates)
+        
+        self.disc_maturities = np.array(discount_curve_data['maturities'])
+        self.disc_rates = np.array(discount_curve_data['rates'])
+        self.disc_cs = CubicSpline(self.disc_maturities, self.disc_rates)
+    
+    def get_inflation_rate_at_maturity(self, t):
+        """Récupère le taux d'inflation forward à une maturity donnée"""
+        if t < self.inf_maturities[0]:
+            return self.inf_rates[0]
+        elif t > self.inf_maturities[-1]:
+            return self.inf_rates[-1]
+        else:
+            return self.inf_cs(t)
+    
+    def get_discount_factor(self, t):
+        """Récupère le facteur d'actualisation nominal"""
+        if t < self.disc_maturities[0]:
+            r = self.disc_rates[0]
+        elif t > self.disc_maturities[-1]:
+            r = self.disc_rates[-1]
+        else:
+            r = self.disc_cs(t)
+        return 1 / (1 + r * t)
+    
+    def day_count_fraction(self, start_date, end_date, convention='ACT/365'):
+        """Calcule la fraction de jour entre deux dates"""
+        delta_days = (end_date - start_date).days
+        
+        if convention == 'ACT/ACT':
+            year_start = start_date.year
+            year_end = end_date.year
+            if year_start == year_end:
+                days_in_year = 366 if self._is_leap_year(year_start) else 365
+                return delta_days / days_in_year
+            else:
+                return delta_days / 365.25
+        elif convention == 'ACT/360':
+            return delta_days / 360
+        elif convention == 'ACT/365':
+            return delta_days / 365
+        elif convention == '30/360':
+            d1 = min(start_date.day, 30)
+            d2 = min(end_date.day, 30) if d1 == 30 else end_date.day
+            days = 360 * (end_date.year - start_date.year) + \
+                   30 * (end_date.month - start_date.month) + (d2 - d1)
+            return days / 360
+        return delta_days / 365
+    
+    def _is_leap_year(self, year):
+        return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+    
+    def generate_payment_dates(self, start_date, end_date, frequency_months):
+        """Génère les dates de paiement"""
+        dates = []
+        current = start_date
+        
+        while current <= end_date:
+            dates.append(current)
+            month = current.month + frequency_months
+            year = current.year + (month - 1) // 12
+            month = ((month - 1) % 12) + 1
+            
+            try:
+                current = current.replace(year=year, month=month)
+            except ValueError:
+                current = current.replace(year=year, month=month, day=28)
+        
+        return dates
+    
+    def calculate_breakeven_inflation(self, t1, t2):
+        """
+        Calcule l'inflation forward entre deux maturités
+        Équivalent au taux forward d'inflation
+        """
+        if t1 == 0:
+            inf_rate_1 = self.inf_rates[0]
+        else:
+            inf_rate_1 = self.get_inflation_rate_at_maturity(t1)
+        
+        inf_rate_2 = self.get_inflation_rate_at_maturity(t2)
+        
+        # Formule simplifié (approximation linéaire)
+        # Pour une formule exacte, utiliser: (1 + inf_rate_2)^t2 / (1 + inf_rate_1)^t1
+        forward_inf = (inf_rate_2 * t2 - inf_rate_1 * t1) / (t2 - t1)
+        
+        return forward_inf
+    
+    def price_inflation_swap(self, pricing_date, start_date, end_date, 
+                            fixed_inflation_rate, spread, frequency_months,
+                            day_count_convention, nominal, 
+                            base_index_level=100, seasonality_adjustment=0.0):
+        """
+        Prix un inflation swap (ZCPN)
+        
+        fixed_inflation_rate: Taux d'inflation fixe du swap
+        spread: Spread appliqué au leg flottant
+        base_index_level: Niveau d'indexe de base (défaut 100)
+        seasonality_adjustment: Ajustement saisonnier (ex: 0.002 = 20bps)
+        """
+        
+        payment_dates = self.generate_payment_dates(start_date, end_date, frequency_months)
+        
+        if payment_dates[-1] != end_date:
+            payment_dates.append(end_date)
+        
+        pv_fixed = 0
+        pv_floating = 0
+        details = []
+        
+        for i in range(len(payment_dates) - 1):
+            period_start = payment_dates[i]
+            period_end = payment_dates[i + 1]
+            
+            # Calcul de l'accrual
+            accrual_fraction = self.day_count_fraction(period_start, period_end, 
+                                                       day_count_convention)
+            
+            # Temps jusqu'au paiement
+            time_to_payment = (period_end - pricing_date).days / 365.25
+            
+            if time_to_payment < 0:
+                continue
+            
+            # Facteur d'actualisation nominal
+            df = self.get_discount_factor(time_to_payment)
+            
+            # === LEG FIXE ===
+            fixed_coupon = (fixed_inflation_rate + spread) * accrual_fraction * nominal
+            pv_fixed += fixed_coupon * df
+            
+            # === LEG FLOTTANT (Inflation réelle) ===
+            # Calcul du taux forward d'inflation
+            t1 = max(0, (period_start - pricing_date).days / 365.25)
+            t2 = (period_end - pricing_date).days / 365.25
+            
+            # Récupérer les taux d'inflation forward
+            forward_inflation = self.calculate_breakeven_inflation(t1, t2)
+            
+            # Ajouter l'ajustement saisonnier
+            floating_inflation_rate = forward_inflation + seasonality_adjustment
+            
+            floating_coupon = floating_inflation_rate * accrual_fraction * nominal
+            pv_floating += floating_coupon * df
+            
+            details.append({
+                'period_start': period_start,
+                'period_end': period_end,
+                'accrual_fraction': accrual_fraction,
+                'time_to_payment': time_to_payment,
+                'discount_factor': df,
+                'inflation_rate': floating_inflation_rate,
+                'fixed_inflation': fixed_inflation_rate,
+                'fixed_coupon': fixed_coupon,
+                'floating_coupon': floating_coupon,
+                'pv_fixed': fixed_coupon * df,
+                'pv_floating': floating_coupon * df
+            })
+        
+        swap_value = pv_floating - pv_fixed
+        
+        return {
+            'swap_value': swap_value,
+            'pv_fixed_leg': pv_fixed,
+            'pv_floating_leg': pv_floating,
+            'details': details,
+            'nominal': nominal,
+            'base_index_level': base_index_level
+        }
+
+
+def display_vanilla_results(result):
+    """Affiche les résultats du pricing vanilla/OIS"""
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -275,13 +449,76 @@ def display_results(result):
     csv = df_details.to_csv(index=False)
     st.download_button(label="Télécharger CSV", data=csv, file_name="swap_details.csv", mime="text/csv")
 
-def create_pricer_page(page_name, curve_data, default_spot_rate, is_ois=False):
+
+def display_inflation_results(result):
+    """Affiche les résultats du pricing inflation swap"""
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Valeur du Swap", f"€ {result['swap_value']:,.0f}")
+    with col2:
+        st.metric("PV Jambe Fixe", f"€ {result['pv_fixed_leg']:,.0f}")
+    with col3:
+        st.metric("PV Jambe Inflation", f"€ {result['pv_floating_leg']:,.0f}")
+    with col4:
+        st.metric("Nominal", f"€ {result['nominal']:,.0f}")
+    
+    st.divider()
+    
+    st.subheader("📊 Détails des Périodes")
+    
+    df_details = pd.DataFrame(result['details'])
+    df_details['period_start'] = df_details['period_start'].dt.strftime('%Y-%m-%d')
+    df_details['period_end'] = df_details['period_end'].dt.strftime('%Y-%m-%d')
+    
+    numeric_cols = ['accrual_fraction', 'time_to_payment', 'discount_factor', 
+                    'inflation_rate', 'fixed_inflation', 'fixed_coupon', 
+                    'floating_coupon', 'pv_fixed', 'pv_floating']
+    for col in numeric_cols:
+        df_details[col] = df_details[col].apply(lambda x: f"{x:.6f}" if col in ['accrual_fraction', 'discount_factor', 'inflation_rate', 'fixed_inflation'] else f"{x:,.2f}")
+    
+    st.dataframe(df_details, use_container_width=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("💰 Flux d'inflation par période")
+        df_plot = pd.DataFrame(result['details'])
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=df_plot['period_end'].dt.strftime('%Y-%m-%d'), 
+                             y=df_plot['pv_fixed'], name='PV Fixe (Inflation)'))
+        fig.add_trace(go.Bar(x=df_plot['period_end'].dt.strftime('%Y-%m-%d'), 
+                             y=df_plot['pv_floating'], name='PV Flottant (Inflation réelle)'))
+        fig.update_layout(barmode='group', height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("📈 Taux d'inflation par période")
+        df_plot = pd.DataFrame(result['details'])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_plot['period_end'].dt.strftime('%Y-%m-%d'), 
+                                 y=df_plot['inflation_rate']*100, mode='lines+markers', 
+                                 name='Inflation Forward'))
+        fig.add_trace(go.Scatter(x=df_plot['period_end'].dt.strftime('%Y-%m-%d'), 
+                                 y=df_plot['fixed_inflation']*100, mode='lines+markers', 
+                                 name='Inflation Fixe', line=dict(dash='dash')))
+        fig.update_yaxes(title_text="Taux d'inflation (%)")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    st.divider()
+    st.subheader("📥 Exporter les résultats")
+    
+    csv = df_details.to_csv(index=False)
+    st.download_button(label="Télécharger CSV", data=csv, file_name="inflation_swap_details.csv", mime="text/csv")
+
+
+def create_vanilla_pricer_page(page_name, curve_data, default_spot_rate, is_ois=False):
     """Crée une page de pricer pour une devise donnée"""
     st.title(f"🔄 Swap Pricer {page_name}")
     
     st.sidebar.header(f"⚙️ Paramètres du Swap {page_name}")
     
-    # Définir les limites de dates
     min_date = datetime(2000, 1, 1).date()
     max_date = datetime(2050, 12, 31).date()
     
@@ -346,10 +583,75 @@ def create_pricer_page(page_name, curve_data, default_spot_rate, is_ois=False):
         st.session_state[f'result_{page_name}'] = result
     
     if f'result_{page_name}' in st.session_state:
-        display_results(st.session_state[f'result_{page_name}'])
+        display_vanilla_results(st.session_state[f'result_{page_name}'])
 
+
+def create_inflation_pricer_page(page_name, inflation_curve_data, discount_curve_data):
+    """Crée une page de pricer pour inflation swaps"""
+    st.title(f"🌡️ Inflation Swap Pricer {page_name}")
+    
+    st.sidebar.header(f"⚙️ Paramètres Inflation {page_name}")
+    
+    min_date = datetime(2000, 1, 1).date()
+    max_date = datetime(2050, 12, 31).date()
+    
+    pricing_date = st.sidebar.date_input("Date de pricing", 
+                                         value=datetime(2026, 3, 18).date(), 
+                                         min_value=min_date,
+                                         max_value=max_date,
+                                         key=f"inf_pricing_{page_name}")
+    start_date = st.sidebar.date_input("Date de début", 
+                                       value=datetime(2025, 5, 19).date(), 
+                                       min_value=min_date,
+                                       max_value=max_date,
+                                       key=f"inf_start_{page_name}")
+    end_date = st.sidebar.date_input("Date de fin", 
+                                     value=datetime(2030, 5, 19).date(), 
+                                     min_value=min_date,
+                                     max_value=max_date,
+                                     key=f"inf_end_{page_name}")
+    
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        fixed_inflation = st.number_input("Taux inflation fixe (%)", value=2.0, step=0.01, format="%.4f", key=f"fixed_inf_{page_name}") / 100
+        spread = st.number_input("Spread (%)", value=0.0, step=0.01, format="%.4f", key=f"spread_inf_{page_name}") / 100
+    
+    with col2:
+        nominal = st.number_input("Nominal (€)", value=180000000, step=1000000, key=f"nominal_inf_{page_name}")
+        frequency_months = st.selectbox("Fréquence paiement", [3, 6, 12], index=2, key=f"freq_inf_{page_name}")
+    
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        day_count = st.sidebar.selectbox("Convention de comptage", 
+                                          ["ACT/360", "ACT/365", "ACT/ACT", "30/360"], 
+                                          key=f"daycount_inf_{page_name}")
+    with col2:
+        seasonality = st.number_input("Ajust. saisonnier (%)", value=0.0, step=0.01, format="%.4f", key=f"season_inf_{page_name}") / 100
+    
+    st.sidebar.divider()
+    st.sidebar.subheader("💡 Inflation Curve")
+    st.sidebar.info(f"Courbe ZCPN injectée depuis Bloomberg")
+    
+    pricing_date = datetime.combine(pricing_date, datetime.min.time())
+    start_date = datetime.combine(start_date, datetime.min.time())
+    end_date = datetime.combine(end_date, datetime.min.time())
+    
+    pricer = InflationSwapPricer(inflation_curve_data, discount_curve_data)
+    
+    if st.sidebar.button("🚀 Calculer", use_container_width=True, key=f"calc_inf_{page_name}"):
+        result = pricer.price_inflation_swap(pricing_date, start_date, end_date, 
+                                             fixed_inflation, spread, frequency_months,
+                                             day_count, nominal, seasonality_adjustment=seasonality)
+        st.session_state[f'result_inf_{page_name}'] = result
+    
+    if f'result_inf_{page_name}' in st.session_state:
+        display_inflation_results(st.session_state[f'result_inf_{page_name}'])
+
+
+# ===========================
 # Configuration Streamlit
-st.set_page_config(page_title="Swap Pricer Multi-Devises", layout="wide")
+# ===========================
+st.set_page_config(page_title="Swap Pricer Multi-Devises & Inflation", layout="wide")
 
 # Données des courbes EURIBOR
 curve_data_euribor = {
@@ -363,7 +665,7 @@ curve_data_euribor = {
               0.03249465, 0.0325185, 0.03251876]
 }
 
-# Données des courbes SOFR (en années)
+# Données des courbes SOFR
 curve_data_sofr = {
     'maturities': [1/52, 2/52, 3/52, 1/12, 2/12, 3/12, 4/12, 5/12, 6/12, 7/12, 8/12, 9/12, 10/12, 11/12, 1, 
                    1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 40, 50],
@@ -371,7 +673,7 @@ curve_data_sofr = {
               0.03936, 0.03974, 0.03994, 0.04013, 0.04044, 0.04082, 0.04122, 0.04161, 0.04199, 0.04237, 0.04311, 0.04404, 0.04476, 0.04469, 0.04428, 0.04310, 0.04178]
 }
 
-# Données des courbes ESTR (en années)
+# Données des courbes ESTR
 curve_data_estr = {
     'maturities': [1/52, 2/52, 1/12, 2/12, 3/12, 4/12, 5/12, 6/12, 7/12, 8/12, 9/12, 10/12, 11/12, 1, 
                    1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 20, 25, 30, 40, 50],
@@ -379,12 +681,27 @@ curve_data_estr = {
               0.02609, 0.02647, 0.02678, 0.02713, 0.02754, 0.02798, 0.02847, 0.02899, 0.02947, 0.02993, 0.03033, 0.03078, 0.03174, 0.03232, 0.03216, 0.03178, 0.03070, 0.02946]
 }
 
-# Navigation
-page = st.sidebar.radio("📍 Sélectionner une devise", ["EURIBOR", "SOFR", "ESTR"])
+# EXEMPLE : Courbe d'inflation ZCPN (à remplacer par tes données Bloomberg)
+inflation_curve_eurhicp = {
+    'maturities': [0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30],
+    'rates': [0.0185, 0.0200, 0.0210, 0.0215, 0.0218, 0.0220, 0.0221, 0.0221, 0.0220, 0.0220, 0.0219, 0.0218, 0.0216, 0.0214, 0.0212, 0.0210]
+}
 
-if page == "EURIBOR":
-    create_pricer_page("EURIBOR", curve_data_euribor, 0.02122, is_ois=False)
-elif page == "SOFR":
-    create_pricer_page("SOFR", curve_data_sofr, 0.03537, is_ois=True)
-elif page == "ESTR":
-    create_pricer_page("ESTR", curve_data_estr, 0.01932, is_ois=True)
+# Navigation avec onglets
+st.sidebar.title("📍 Navigation")
+page = st.sidebar.radio("Sélectionner une section", 
+                        ["Vanilla Swaps", "Inflation Swaps"])
+
+if page == "Vanilla Swaps":
+    subpage = st.sidebar.selectbox("Devise", ["EURIBOR", "SOFR", "ESTR"])
+    
+    if subpage == "EURIBOR":
+        create_vanilla_pricer_page("EURIBOR", curve_data_euribor, 0.02122, is_ois=False)
+    elif subpage == "SOFR":
+        create_vanilla_pricer_page("SOFR", curve_data_sofr, 0.03537, is_ois=True)
+    elif subpage == "ESTR":
+        create_vanilla_pricer_page("ESTR", curve_data_estr, 0.01932, is_ois=True)
+
+elif page == "Inflation Swaps":
+    st.sidebar.info("💡 **Injecte ta courbe ZCPN d'inflation Bloomberg ici**")
+    create_inflation_pricer_page("EUR HICP", inflation_curve_eurhicp, curve_data_euribor)
